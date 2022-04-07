@@ -1,0 +1,3068 @@
+# Predicting meat quality using machine learning
+# Analises para a dissertação do discente Pablo Lobo
+
+
+
+# Loading packages --------------------------------------------------------
+require(tidyverse)
+require(tidylog)
+require(prospectr)
+require(caret)
+require(doParallel)
+require(doSNOW)
+
+
+# Helping functions -------------------------------------------------------
+
+# Function to calculate the Mean arctangent absolute percentage error as proposed
+# by Kim & Kim (2016) DOI: https://doi.org/10.1016/j.ijforecast.2015.12.003
+MAAPE <- function(obs, pred){
+  
+  maape <- mean(atan(abs(obs - pred)/abs(obs)))
+  
+  return(maape * 100)
+  
+}
+
+
+# Function to calculate metric to evaluate models
+ModelEvaluation <- function(model,
+                            target.variable,
+                            train.data,
+                            validation.data,
+                            model.name) {
+  
+  # Training data set
+  
+  r2.train <- R2(pred = predict(model, 
+                                train.data),
+                 obs = train.data %>% 
+                   pull(target.variable),
+                 formula = "traditional")
+  
+  mae.train <- MAE(pred = predict(model, 
+                                  train.data),
+                   obs = train.data %>% 
+                     pull(target.variable))
+  
+  rmse.train <- RMSE(pred = predict(model, 
+                                    train.data),
+                     obs = train.data %>% 
+                       pull(target.variable))
+  
+  
+  maape.train <- MAAPE(pred = predict(model, 
+                                      train.data),
+                       obs = train.data %>% 
+                         pull(target.variable))  
+  
+  # Validation data set
+  
+  r2.val <- R2(pred = predict(model, 
+                              validation.data),
+               obs = validation.data %>%  
+                 pull(target.variable),
+               formula = "traditional")
+  
+  mae.val <- MAE(pred = predict(model, 
+                                validation.data),
+                 obs = validation.data %>%  
+                   pull(target.variable))
+  
+  rmse.val <- RMSE(pred = predict(model, 
+                                  validation.data),
+                   obs = validation.data %>%  
+                     pull(target.variable))
+  
+  maape.val <- MAAPE(pred = predict(model, 
+                                    validation.data),
+                     obs = validation.data %>%  
+                       pull(target.variable))
+  
+  
+  res <- tibble(model = model.name,
+                data.set = c(rep("training", 4), rep("validation", 4)),
+                metric = rep(c("r2", "MAE", "RMSE", "MAAPE"), 2),
+                value = c(r2.train, mae.train, rmse.train, maape.train,
+                          r2.val, mae.val, rmse.val, maape.val))
+  
+  return(res)
+  
+}
+
+
+
+# Reading data ------------------------------------------------------------
+
+d1 <- read.table("./data/dados_total.txt",
+                 header = TRUE,
+                 dec = ",")
+
+
+
+# Data preparation --------------------------------------------------------
+
+length(row.names(d1))
+length(unique(d1$Amostra))
+
+# It seems there is 1 duplicated observation
+
+d1 %>% 
+  group_by(Amostra) %>% 
+  filter(n() > 1) %>% 
+  summarize(n=n())
+
+d1 %>% 
+  filter(Amostra == 8328) %>% 
+  View()
+
+
+# Impossible to identify which observation is actually correct. Removing both 
+
+d2 <- d1 %>% 
+  filter(Amostra != 8328)
+
+
+
+# Data preparation ####
+
+## Savitzky-Golay ####
+# Savitzky-Golay transformation with a differentiation order of 1, polynomial 
+# order of 3 and a window size of 11 as similar to Fowler et al. (2020) 
+# https://doi.org/10.1016/j.meatsci.2020.108153
+
+
+d2.smooth <- savitzkyGolay(d2 %>% 
+                             select(-c("Amostra", "Temp", "Faz", "Maciez", 
+                                       "Marmoreio", "CorA", "CorB", "CorL")),
+                           m = 1,
+                           p = 3, 
+                           w = 11) %>% 
+  data.frame() %>% 
+  cbind(d2 %>% 
+          select(c("Amostra", "Temp", "Faz", "Maciez", 
+                    "Marmoreio", "CorA", "CorB", "CorL")))
+
+## Reduced spectral range (rsr) ####
+# As suggested in Magalhães et al., (2018; DOI: 10.1093/jas/sky284), 
+# keeping only wavenumbers from 2,420 to 1,097 nm, which is ruffly 
+# 4,132 cm-1 and 9,116 cm–1
+
+waves <- paste("X", seq(from = 4132,
+                        to = 9116, by = 2), "cm.1", sep = "")
+
+d2.rsr <- d2 %>% 
+  select(c("Amostra", "Temp", "Faz", "Maciez", 
+           "Marmoreio", "CorA", "CorB", "CorL", all_of(waves)))
+
+
+
+# Modeling ----------------------------------------------------------------
+
+# Maciez ####
+
+
+# Creating training and validation data splits
+
+## Raw waves ####
+
+set.seed(1810)
+splitIndex <- splitTools::partition(d2$Maciez, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.Maciez <- d2[splitIndex$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+valid.Maciez <- d2[splitIndex$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Maciez$Maciez, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Maciez), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Maciez <- train(Maciez ~ ., 
+                    data = train.Maciez, 
+                    method = "pls",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Maciez <- train(Maciez ~ ., 
+                      data = train.Maciez, 
+                      method = "rpart",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Maciez <- train(Maciez ~ ., 
+                    data = train.Maciez, 
+                    method = "gbm",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Maciez <- train(Maciez ~ ., 
+                   data = train.Maciez, 
+                   method = "ranger",
+                   metric = "RMSE",
+                   trControl = fit_control,
+                   tuneLength = 5,
+                   
+                   num.trees = 2000)
+
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Maciez <- train(Maciez ~ ., 
+                         data = train.Maciez, 
+                         method = "svmPoly",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Maciez <- train(Maciez ~ ., 
+                        data = train.Maciez, 
+                        method = "svmRadial",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_Maciez <- data.frame()
+
+
+res_Maciez <- rbind(res_Maciez, 
+                    ModelEvaluation(model = pls_Maciez,
+                                    target.variable = "Maciez",
+                                    train.data = train.Maciez,
+                                    validation.data = valid.Maciez,
+                                    model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Maciez,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez,
+                        validation.data = valid.Maciez,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_Maciez,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez,
+                        validation.data = valid.Maciez,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Maciez,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez,
+                        validation.data = valid.Maciez,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Maciez,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez,
+                        validation.data = valid.Maciez,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Maciez,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez,
+                        validation.data = valid.Maciez,
+                        model.name = "svm.rad"))
+
+
+res_Maciez %>% 
+  filter(data.set == "training") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+res_Maciez %>% 
+  # filter(data.set == "training") %>% 
+  group_by(metric) %>%
+  data.frame() %>% 
+  plyr::arrange(data.set, model, metric) %>% 
+  rhandsontable::rhandsontable(useTypes = FALSE)
+
+
+
+
+## Savitzky-Golay smoothed and differentiated ####
+
+set.seed(1810)
+splitIndex.smooth <- splitTools::partition(d2.smooth$Maciez, 
+                                           p = c(train = 0.75, valid = 0.25))
+
+train.Maciez.smooth <- d2.smooth[splitIndex.smooth$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+valid.Maciez.smooth <- d2.smooth[splitIndex.smooth$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Maciez.smooth$Maciez, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Maciez.smooth), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Maciez.smooth <- train(Maciez ~ ., 
+                           data = train.Maciez.smooth, 
+                           method = "pls",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Maciez.smooth <- train(Maciez ~ ., 
+                             data = train.Maciez.smooth, 
+                             method = "rpart",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Maciez.smooth <- train(Maciez ~ ., 
+                           data = train.Maciez.smooth, 
+                           method = "gbm",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Maciez.smooth <- train(Maciez ~ ., 
+                          data = train.Maciez.smooth, 
+                          method = "ranger",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5,
+                          
+                          num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Maciez.smooth <- train(Maciez ~ ., 
+                                data = train.Maciez.smooth, 
+                                method = "svmPoly",
+                                metric = "RMSE",
+                                trControl = fit_control,
+                                tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Maciez.smooth <- train(Maciez ~ ., 
+                               data = train.Maciez.smooth, 
+                               method = "svmRadial",
+                               metric = "RMSE",
+                               trControl = fit_control,
+                               tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_Maciez.smooth <- data.frame()
+
+
+res_Maciez.smooth <- rbind(res_Maciez.smooth, 
+                           ModelEvaluation(model = pls_Maciez.smooth,
+                                           target.variable = "Maciez",
+                                           train.data = train.Maciez.smooth,
+                                           validation.data = valid.Maciez.smooth,
+                                           model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Maciez.smooth,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.smooth,
+                        validation.data = valid.Maciez.smooth,
+                        model.name = "rpart")) %>%
+  
+  
+  rbind(ModelEvaluation(model = gbm_Maciez.smooth,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.smooth,
+                        validation.data = valid.Maciez.smooth,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Maciez.smooth,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.smooth,
+                        validation.data = valid.Maciez.smooth,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Maciez.smooth,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.smooth,
+                        validation.data = valid.Maciez.smooth,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Maciez.smooth,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.smooth,
+                        validation.data = valid.Maciez.smooth,
+                        model.name = "svm.rad"))
+
+
+res_Maciez.smooth %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+res_Maciez.smooth %>% 
+  # filter(data.set == "training") %>% 
+  group_by(metric) %>%
+  data.frame() %>% 
+  plyr::arrange(data.set, model, metric) %>% 
+  rhandsontable::rhandsontable(useTypes = FALSE)
+
+
+
+
+## Reduction of spectral range ####
+
+set.seed(1810)
+splitIndex.rsr <- splitTools::partition(d2.rsr$Maciez, 
+                                        p = c(train = 0.75, valid = 0.25))
+
+train.Maciez.rsr <- d2.rsr[splitIndex.rsr$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+valid.Maciez.rsr <- d2.rsr[splitIndex.rsr$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Marmoreio", "CorA",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Maciez.rsr$Maciez, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Maciez.rsr), by = 1)[-folds[[i]]] %>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Maciez.rsr <- train(Maciez ~ ., 
+                        data = train.Maciez.rsr, 
+                        method = "pls",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Maciez.rsr <- train(Maciez ~ ., 
+                          data = train.Maciez.rsr, 
+                          method = "rpart",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Maciez.rsr <- train(Maciez ~ ., 
+                        data = train.Maciez.rsr, 
+                        method = "gbm",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5)
+
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Maciez.rsr <- train(Maciez ~ ., 
+                       data = train.Maciez.rsr, 
+                       method = "ranger",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 5,
+                       
+                       num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Maciez.rsr <- train(Maciez ~ ., 
+                             data = train.Maciez.rsr, 
+                             method = "svmPoly",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Maciez.rsr <- train(Maciez ~ ., 
+                            data = train.Maciez.rsr, 
+                            method = "svmRadial",
+                            metric = "RMSE",
+                            trControl = fit_control,
+                            tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+res_Maciez.rsr <- data.frame()
+
+
+res_Maciez.rsr <- rbind(res_Maciez.rsr, 
+                        ModelEvaluation(model = pls_Maciez.rsr,
+                                        target.variable = "Maciez",
+                                        train.data = train.Maciez.rsr,
+                                        validation.data = valid.Maciez.rsr,
+                                        model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Maciez.rsr,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.rsr,
+                        validation.data = valid.Maciez.rsr,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_Maciez.rsr,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.rsr,
+                        validation.data = valid.Maciez.rsr,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Maciez.rsr,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.rsr,
+                        validation.data = valid.Maciez.rsr,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Maciez.rsr,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.rsr,
+                        validation.data = valid.Maciez.rsr,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Maciez.rsr,
+                        target.variable = "Maciez",
+                        train.data = train.Maciez.rsr,
+                        validation.data = valid.Maciez.rsr,
+                        model.name = "svm.rad"))
+
+
+res_Maciez.rsr %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+# Comb Res Maciez ####
+
+
+comb_res_maciez <- res_Maciez %>% 
+  mutate(trat = "raw") %>% 
+  rbind(res_Maciez.rsr %>% 
+          mutate(trat = "rsr")) %>% 
+  rbind(res_Maciez.smooth %>% 
+          mutate(trat = "sgsd")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(model = factor(model, 
+                        levels = c("pls", "rpart", "gbm", "rf", "svm.poly",
+                                   "svm.rad")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         
+         trat = factor(trat,
+                       levels = c("raw", "rsr", "sgsd")))
+
+
+comb_res_maciez %>% 
+  filter(data.set == "training", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2)%>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+comb_res_maciez %>% 
+  filter(data.set == "validation", metric == "r2") %>% 
+  mutate_if(is.numeric, round, 2)%>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+# Marmoreio ####
+
+
+# Creating training and validation data splits
+
+## Raw waves ####
+
+set.seed(1810)
+splitIndex <- splitTools::partition(d2$Marmoreio, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.Marmoreio <- d2[splitIndex$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+valid.Marmoreio <- d2[splitIndex$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Marmoreio$Marmoreio, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Marmoreio), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Marmoreio <- train(Marmoreio ~ ., 
+                       data = train.Marmoreio, 
+                       method = "pls",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Marmoreio <- train(Marmoreio ~ ., 
+                         data = train.Marmoreio, 
+                         method = "rpart",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Marmoreio <- train(Marmoreio ~ ., 
+                       data = train.Marmoreio, 
+                       method = "gbm",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Marmoreio <- train(Marmoreio ~ ., 
+                      data = train.Marmoreio, 
+                      method = "ranger",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5,
+                      
+                      num.trees = 2000)
+
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Marmoreio <- train(Marmoreio ~ ., 
+                            data = train.Marmoreio, 
+                            method = "svmPoly",
+                            metric = "RMSE",
+                            trControl = fit_control,
+                            tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Marmoreio <- train(Marmoreio ~ ., 
+                           data = train.Marmoreio, 
+                           method = "svmRadial",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_Marmoreio <- data.frame()
+
+
+res_Marmoreio <- rbind(res_Marmoreio, 
+                       ModelEvaluation(model = pls_Marmoreio,
+                                       target.variable = "Marmoreio",
+                                       train.data = train.Marmoreio,
+                                       validation.data = valid.Marmoreio,
+                                       model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Marmoreio,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio,
+                        validation.data = valid.Marmoreio,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_Marmoreio,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio,
+                        validation.data = valid.Marmoreio,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Marmoreio,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio,
+                        validation.data = valid.Marmoreio,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Marmoreio,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio,
+                        validation.data = valid.Marmoreio,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Marmoreio,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio,
+                        validation.data = valid.Marmoreio,
+                        model.name = "svm.rad"))
+
+
+res_Marmoreio %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+## Savitzky-Golay smoothed and differentiated ####
+
+set.seed(1810)
+splitIndex.smooth <- splitTools::partition(d2.smooth$Marmoreio, 
+                                           p = c(train = 0.75, valid = 0.25))
+
+train.Marmoreio.smooth <- d2.smooth[splitIndex.smooth$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+valid.Marmoreio.smooth <- d2.smooth[splitIndex.smooth$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Marmoreio.smooth$Marmoreio, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Marmoreio.smooth), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Marmoreio.smooth <- train(Marmoreio ~ ., 
+                              data = train.Marmoreio.smooth, 
+                              method = "pls",
+                              metric = "RMSE",
+                              trControl = fit_control,
+                              tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Marmoreio.smooth <- train(Marmoreio ~ ., 
+                                data = train.Marmoreio.smooth, 
+                                method = "rpart",
+                                metric = "RMSE",
+                                trControl = fit_control,
+                                tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Marmoreio.smooth <- train(Marmoreio ~ ., 
+                              data = train.Marmoreio.smooth, 
+                              method = "gbm",
+                              metric = "RMSE",
+                              trControl = fit_control,
+                              tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Marmoreio.smooth <- train(Marmoreio ~ ., 
+                             data = train.Marmoreio.smooth, 
+                             method = "ranger",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5,
+                             
+                             num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Marmoreio.smooth <- train(Marmoreio ~ ., 
+                                   data = train.Marmoreio.smooth, 
+                                   method = "svmPoly",
+                                   metric = "RMSE",
+                                   trControl = fit_control,
+                                   tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Marmoreio.smooth <- train(Marmoreio ~ ., 
+                                  data = train.Marmoreio.smooth, 
+                                  method = "svmRadial",
+                                  metric = "RMSE",
+                                  trControl = fit_control,
+                                  tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_Marmoreio.smooth <- data.frame()
+
+
+res_Marmoreio.smooth <- rbind(res_Marmoreio.smooth, 
+                              ModelEvaluation(model = pls_Marmoreio.smooth,
+                                              target.variable = "Marmoreio",
+                                              train.data = train.Marmoreio.smooth,
+                                              validation.data = valid.Marmoreio.smooth,
+                                              model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Marmoreio.smooth,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.smooth,
+                        validation.data = valid.Marmoreio.smooth,
+                        model.name = "rpart")) %>%
+  
+  
+  rbind(ModelEvaluation(model = gbm_Marmoreio.smooth,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.smooth,
+                        validation.data = valid.Marmoreio.smooth,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Marmoreio.smooth,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.smooth,
+                        validation.data = valid.Marmoreio.smooth,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Marmoreio.smooth,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.smooth,
+                        validation.data = valid.Marmoreio.smooth,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Marmoreio.smooth,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.smooth,
+                        validation.data = valid.Marmoreio.smooth,
+                        model.name = "svm.rad"))
+
+
+res_Marmoreio.smooth %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+## Reduction of spectral range ####
+
+set.seed(1810)
+splitIndex.rsr <- splitTools::partition(d2.rsr$Marmoreio, 
+                                        p = c(train = 0.75, valid = 0.25))
+
+train.Marmoreio.rsr <- d2.rsr[splitIndex.rsr$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+valid.Marmoreio.rsr <- d2.rsr[splitIndex.rsr$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "CorA",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.Marmoreio.rsr$Marmoreio, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.Marmoreio.rsr), by = 1)[-folds[[i]]] %>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_Marmoreio.rsr <- train(Marmoreio ~ ., 
+                           data = train.Marmoreio.rsr, 
+                           method = "pls",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_Marmoreio.rsr <- train(Marmoreio ~ ., 
+                             data = train.Marmoreio.rsr, 
+                             method = "rpart",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_Marmoreio.rsr <- train(Marmoreio ~ ., 
+                           data = train.Marmoreio.rsr, 
+                           method = "gbm",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+
+### Random Forest ####
+set.seed(1801)
+rf_Marmoreio.rsr <- train(Marmoreio ~ ., 
+                          data = train.Marmoreio.rsr, 
+                          method = "ranger",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5,
+                          
+                          num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.Marmoreio.rsr <- train(Marmoreio ~ ., 
+                                data = train.Marmoreio.rsr, 
+                                method = "svmPoly",
+                                metric = "RMSE",
+                                trControl = fit_control,
+                                tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.Marmoreio.rsr <- train(Marmoreio ~ ., 
+                               data = train.Marmoreio.rsr, 
+                               method = "svmRadial",
+                               metric = "RMSE",
+                               trControl = fit_control,
+                               tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+res_Marmoreio.rsr <- data.frame()
+
+
+res_Marmoreio.rsr <- rbind(res_Marmoreio.rsr, 
+                           ModelEvaluation(model = pls_Marmoreio.rsr,
+                                           target.variable = "Marmoreio",
+                                           train.data = train.Marmoreio.rsr,
+                                           validation.data = valid.Marmoreio.rsr,
+                                           model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_Marmoreio.rsr,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.rsr,
+                        validation.data = valid.Marmoreio.rsr,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_Marmoreio.rsr,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.rsr,
+                        validation.data = valid.Marmoreio.rsr,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_Marmoreio.rsr,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.rsr,
+                        validation.data = valid.Marmoreio.rsr,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.Marmoreio.rsr,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.rsr,
+                        validation.data = valid.Marmoreio.rsr,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.Marmoreio.rsr,
+                        target.variable = "Marmoreio",
+                        train.data = train.Marmoreio.rsr,
+                        validation.data = valid.Marmoreio.rsr,
+                        model.name = "svm.rad"))
+
+
+res_Marmoreio.rsr %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+# Comb Res Marmoreio ####
+
+comb_res_Marmoreio <- res_Marmoreio %>% 
+  mutate(trat = "raw") %>% 
+  rbind(res_Marmoreio.rsr %>% 
+          mutate(trat = "rsr")) %>% 
+  rbind(res_Marmoreio.smooth %>% 
+          mutate(trat = "sgsd")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(model = factor(model, 
+                        levels = c("pls", "rpart", "gbm", "rf", "svm.poly",
+                                   "svm.rad")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         
+         trat = factor(trat,
+                       levels = c("raw", "rsr", "sgsd")))
+
+
+comb_res_Marmoreio %>% 
+  filter(data.set == "training", metric == "r2") %>% 
+  mutate_if(is.numeric, round, 2)%>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+comb_res_Marmoreio %>% 
+  filter(data.set == "validation", metric == "r2") %>% 
+  mutate_if(is.numeric, round, 2)%>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+
+
+# CorA ####
+
+
+# Creating training and validation data splits
+
+## Raw waves ####
+
+set.seed(1810)
+splitIndex <- splitTools::partition(d2$CorA, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.CorA <- d2[splitIndex$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+valid.CorA <- d2[splitIndex$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorA$CorA, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorA), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorA <- train(CorA ~ ., 
+                  data = train.CorA, 
+                  method = "pls",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorA <- train(CorA ~ ., 
+                    data = train.CorA, 
+                    method = "rpart",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorA <- train(CorA ~ ., 
+                  data = train.CorA, 
+                  method = "gbm",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorA <- train(CorA ~ ., 
+                 data = train.CorA, 
+                 method = "ranger",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 tuneLength = 5,
+                 
+                 num.trees = 2000)
+
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorA <- train(CorA ~ ., 
+                       data = train.CorA, 
+                       method = "svmPoly",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorA <- train(CorA ~ ., 
+                      data = train.CorA, 
+                      method = "svmRadial",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorA <- data.frame()
+
+
+res_CorA <- rbind(res_CorA, 
+                  ModelEvaluation(model = pls_CorA,
+                                  target.variable = "CorA",
+                                  train.data = train.CorA,
+                                  validation.data = valid.CorA,
+                                  model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorA,
+                        target.variable = "CorA",
+                        train.data = train.CorA,
+                        validation.data = valid.CorA,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorA,
+                        target.variable = "CorA",
+                        train.data = train.CorA,
+                        validation.data = valid.CorA,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorA,
+                        target.variable = "CorA",
+                        train.data = train.CorA,
+                        validation.data = valid.CorA,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorA,
+                        target.variable = "CorA",
+                        train.data = train.CorA,
+                        validation.data = valid.CorA,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorA,
+                        target.variable = "CorA",
+                        train.data = train.CorA,
+                        validation.data = valid.CorA,
+                        model.name = "svm.rad"))
+
+
+res_CorA %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+## Savitzky-Golay smoothed and differentiated ####
+
+set.seed(1810)
+splitIndex.smooth <- splitTools::partition(d2.smooth$CorA, 
+                                           p = c(train = 0.75, valid = 0.25))
+
+train.CorA.smooth <- d2.smooth[splitIndex.smooth$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+valid.CorA.smooth <- d2.smooth[splitIndex.smooth$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorA.smooth$CorA, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorA.smooth), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorA.smooth <- train(CorA ~ ., 
+                         data = train.CorA.smooth, 
+                         method = "pls",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorA.smooth <- train(CorA ~ ., 
+                           data = train.CorA.smooth, 
+                           method = "rpart",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorA.smooth <- train(CorA ~ ., 
+                         data = train.CorA.smooth, 
+                         method = "gbm",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorA.smooth <- train(CorA ~ ., 
+                        data = train.CorA.smooth, 
+                        method = "ranger",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5,
+                        
+                        num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorA.smooth <- train(CorA ~ ., 
+                              data = train.CorA.smooth, 
+                              method = "svmPoly",
+                              metric = "RMSE",
+                              trControl = fit_control,
+                              tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorA.smooth <- train(CorA ~ ., 
+                             data = train.CorA.smooth, 
+                             method = "svmRadial",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorA.smooth <- data.frame()
+
+
+res_CorA.smooth <- rbind(res_CorA.smooth, 
+                         ModelEvaluation(model = pls_CorA.smooth,
+                                         target.variable = "CorA",
+                                         train.data = train.CorA.smooth,
+                                         validation.data = valid.CorA.smooth,
+                                         model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorA.smooth,
+                        target.variable = "CorA",
+                        train.data = train.CorA.smooth,
+                        validation.data = valid.CorA.smooth,
+                        model.name = "rpart")) %>%
+  
+  
+  rbind(ModelEvaluation(model = gbm_CorA.smooth,
+                        target.variable = "CorA",
+                        train.data = train.CorA.smooth,
+                        validation.data = valid.CorA.smooth,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorA.smooth,
+                        target.variable = "CorA",
+                        train.data = train.CorA.smooth,
+                        validation.data = valid.CorA.smooth,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorA.smooth,
+                        target.variable = "CorA",
+                        train.data = train.CorA.smooth,
+                        validation.data = valid.CorA.smooth,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorA.smooth,
+                        target.variable = "CorA",
+                        train.data = train.CorA.smooth,
+                        validation.data = valid.CorA.smooth,
+                        model.name = "svm.rad"))
+
+
+res_CorA.smooth %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+## Reduction of spectral range ####
+
+set.seed(1810)
+splitIndex.rsr <- splitTools::partition(d2.rsr$CorA, 
+                                        p = c(train = 0.75, valid = 0.25))
+
+train.CorA.rsr <- d2.rsr[splitIndex.rsr$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+valid.CorA.rsr <- d2.rsr[splitIndex.rsr$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorB", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorA.rsr$CorA, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorA.rsr), by = 1)[-folds[[i]]] %>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorA.rsr <- train(CorA ~ ., 
+                      data = train.CorA.rsr, 
+                      method = "pls",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorA.rsr <- train(CorA ~ ., 
+                        data = train.CorA.rsr, 
+                        method = "rpart",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorA.rsr <- train(CorA ~ ., 
+                      data = train.CorA.rsr, 
+                      method = "gbm",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorA.rsr <- train(CorA ~ ., 
+                     data = train.CorA.rsr, 
+                     method = "ranger",
+                     metric = "RMSE",
+                     trControl = fit_control,
+                     tuneLength = 5,
+                     
+                     num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorA.rsr <- train(CorA ~ ., 
+                           data = train.CorA.rsr, 
+                           method = "svmPoly",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorA.rsr <- train(CorA ~ ., 
+                          data = train.CorA.rsr, 
+                          method = "svmRadial",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+res_CorA.rsr <- data.frame()
+
+
+res_CorA.rsr <- rbind(res_CorA.rsr, 
+                      ModelEvaluation(model = pls_CorA.rsr,
+                                      target.variable = "CorA",
+                                      train.data = train.CorA.rsr,
+                                      validation.data = valid.CorA.rsr,
+                                      model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorA.rsr,
+                        target.variable = "CorA",
+                        train.data = train.CorA.rsr,
+                        validation.data = valid.CorA.rsr,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorA.rsr,
+                        target.variable = "CorA",
+                        train.data = train.CorA.rsr,
+                        validation.data = valid.CorA.rsr,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorA.rsr,
+                        target.variable = "CorA",
+                        train.data = train.CorA.rsr,
+                        validation.data = valid.CorA.rsr,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorA.rsr,
+                        target.variable = "CorA",
+                        train.data = train.CorA.rsr,
+                        validation.data = valid.CorA.rsr,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorA.rsr,
+                        target.variable = "CorA",
+                        train.data = train.CorA.rsr,
+                        validation.data = valid.CorA.rsr,
+                        model.name = "svm.rad"))
+
+
+res_CorA.rsr %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+# Comb Res CorA ####
+
+comb_res_CorA <- res_CorA %>% 
+  mutate(trat = "raw") %>% 
+  rbind(res_CorA.rsr %>% 
+          mutate(trat = "rsr")) %>% 
+  rbind(res_CorA.smooth %>% 
+          mutate(trat = "sgsd")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(model = factor(model, 
+                        levels = c("pls", "rpart", "gbm", "rf", "svm.poly",
+                                   "svm.rad")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         
+         trat = factor(trat,
+                       levels = c("raw", "rsr", "sgsd")))
+
+
+comb_res_CorA %>% 
+  filter(data.set == "training", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+
+comb_res_CorA %>% 
+  filter(data.set == "validation", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+
+# CorB ####
+
+
+# Creating training and validation data splits
+
+## Raw waves ####
+
+set.seed(1810)
+splitIndex <- splitTools::partition(d2$CorB, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.CorB <- d2[splitIndex$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+valid.CorB <- d2[splitIndex$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorB$CorB, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorB), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorB <- train(CorB ~ ., 
+                  data = train.CorB, 
+                  method = "pls",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorB <- train(CorB ~ ., 
+                    data = train.CorB, 
+                    method = "rpart",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorB <- train(CorB ~ ., 
+                  data = train.CorB, 
+                  method = "gbm",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorB <- train(CorB ~ ., 
+                 data = train.CorB, 
+                 method = "ranger",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 tuneLength = 5,
+                 
+                 num.trees = 2000)
+
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorB <- train(CorB ~ ., 
+                       data = train.CorB, 
+                       method = "svmPoly",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorB <- train(CorB ~ ., 
+                      data = train.CorB, 
+                      method = "svmRadial",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorB <- data.frame()
+
+
+res_CorB <- rbind(res_CorB, 
+                  ModelEvaluation(model = pls_CorB,
+                                  target.variable = "CorB",
+                                  train.data = train.CorB,
+                                  validation.data = valid.CorB,
+                                  model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorB,
+                        target.variable = "CorB",
+                        train.data = train.CorB,
+                        validation.data = valid.CorB,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorB,
+                        target.variable = "CorB",
+                        train.data = train.CorB,
+                        validation.data = valid.CorB,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorB,
+                        target.variable = "CorB",
+                        train.data = train.CorB,
+                        validation.data = valid.CorB,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorB,
+                        target.variable = "CorB",
+                        train.data = train.CorB,
+                        validation.data = valid.CorB,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorB,
+                        target.variable = "CorB",
+                        train.data = train.CorB,
+                        validation.data = valid.CorB,
+                        model.name = "svm.rad"))
+
+
+res_CorB %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+
+## Savitzky-Golay smoothed and differentiated ####
+
+set.seed(1810)
+splitIndex.smooth <- splitTools::partition(d2.smooth$CorB, 
+                                           p = c(train = 0.75, valid = 0.25))
+
+train.CorB.smooth <- d2.smooth[splitIndex.smooth$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+valid.CorB.smooth <- d2.smooth[splitIndex.smooth$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorB.smooth$CorB, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorB.smooth), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorB.smooth <- train(CorB ~ ., 
+                         data = train.CorB.smooth, 
+                         method = "pls",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorB.smooth <- train(CorB ~ ., 
+                           data = train.CorB.smooth, 
+                           method = "rpart",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorB.smooth <- train(CorB ~ ., 
+                         data = train.CorB.smooth, 
+                         method = "gbm",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorB.smooth <- train(CorB ~ ., 
+                        data = train.CorB.smooth, 
+                        method = "ranger",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5,
+                        
+                        num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorB.smooth <- train(CorB ~ ., 
+                              data = train.CorB.smooth, 
+                              method = "svmPoly",
+                              metric = "RMSE",
+                              trControl = fit_control,
+                              tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorB.smooth <- train(CorB ~ ., 
+                             data = train.CorB.smooth, 
+                             method = "svmRadial",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorB.smooth <- data.frame()
+
+
+res_CorB.smooth <- rbind(res_CorB.smooth, 
+                         ModelEvaluation(model = pls_CorB.smooth,
+                                         target.variable = "CorB",
+                                         train.data = train.CorB.smooth,
+                                         validation.data = valid.CorB.smooth,
+                                         model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorB.smooth,
+                        target.variable = "CorB",
+                        train.data = train.CorB.smooth,
+                        validation.data = valid.CorB.smooth,
+                        model.name = "rpart")) %>%
+  
+  
+  rbind(ModelEvaluation(model = gbm_CorB.smooth,
+                        target.variable = "CorB",
+                        train.data = train.CorB.smooth,
+                        validation.data = valid.CorB.smooth,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorB.smooth,
+                        target.variable = "CorB",
+                        train.data = train.CorB.smooth,
+                        validation.data = valid.CorB.smooth,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorB.smooth,
+                        target.variable = "CorB",
+                        train.data = train.CorB.smooth,
+                        validation.data = valid.CorB.smooth,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorB.smooth,
+                        target.variable = "CorB",
+                        train.data = train.CorB.smooth,
+                        validation.data = valid.CorB.smooth,
+                        model.name = "svm.rad"))
+
+
+res_CorB.smooth %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+## Reduction of spectral range ####
+
+set.seed(1810)
+splitIndex.rsr <- splitTools::partition(d2.rsr$CorB, 
+                                        p = c(train = 0.75, valid = 0.25))
+
+train.CorB.rsr <- d2.rsr[splitIndex.rsr$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+valid.CorB.rsr <- d2.rsr[splitIndex.rsr$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorL"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorB.rsr$CorB, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorB.rsr), by = 1)[-folds[[i]]] %>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorB.rsr <- train(CorB ~ ., 
+                      data = train.CorB.rsr, 
+                      method = "pls",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorB.rsr <- train(CorB ~ ., 
+                        data = train.CorB.rsr, 
+                        method = "rpart",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorB.rsr <- train(CorB ~ ., 
+                      data = train.CorB.rsr, 
+                      method = "gbm",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorB.rsr <- train(CorB ~ ., 
+                     data = train.CorB.rsr, 
+                     method = "ranger",
+                     metric = "RMSE",
+                     trControl = fit_control,
+                     tuneLength = 5,
+                     
+                     num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorB.rsr <- train(CorB ~ ., 
+                           data = train.CorB.rsr, 
+                           method = "svmPoly",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorB.rsr <- train(CorB ~ ., 
+                          data = train.CorB.rsr, 
+                          method = "svmRadial",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+res_CorB.rsr <- data.frame()
+
+
+res_CorB.rsr <- rbind(res_CorB.rsr, 
+                      ModelEvaluation(model = pls_CorB.rsr,
+                                      target.variable = "CorB",
+                                      train.data = train.CorB.rsr,
+                                      validation.data = valid.CorB.rsr,
+                                      model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorB.rsr,
+                        target.variable = "CorB",
+                        train.data = train.CorB.rsr,
+                        validation.data = valid.CorB.rsr,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorB.rsr,
+                        target.variable = "CorB",
+                        train.data = train.CorB.rsr,
+                        validation.data = valid.CorB.rsr,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorB.rsr,
+                        target.variable = "CorB",
+                        train.data = train.CorB.rsr,
+                        validation.data = valid.CorB.rsr,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorB.rsr,
+                        target.variable = "CorB",
+                        train.data = train.CorB.rsr,
+                        validation.data = valid.CorB.rsr,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorB.rsr,
+                        target.variable = "CorB",
+                        train.data = train.CorB.rsr,
+                        validation.data = valid.CorB.rsr,
+                        model.name = "svm.rad"))
+
+
+res_CorB.rsr %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+
+# Comb Res CorB ####
+
+comb_res_CorB <- res_CorB %>% 
+  mutate(trat = "raw") %>% 
+  rbind(res_CorB.rsr %>% 
+          mutate(trat = "rsr")) %>% 
+  rbind(res_CorB.smooth %>% 
+          mutate(trat = "sgsd")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(model = factor(model, 
+                        levels = c("pls", "rpart", "gbm", "rf", "svm.poly",
+                                   "svm.rad")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         
+         trat = factor(trat,
+                       levels = c("raw", "rsr", "sgsd")))
+
+
+comb_res_CorB %>% 
+  filter(data.set == "training", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+comb_res_CorB %>% 
+  filter(data.set == "validation", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+
+# CorL ####
+
+
+# Creating training and validation data splits
+
+## Raw waves ####
+
+set.seed(1810)
+splitIndex <- splitTools::partition(d2$CorL, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.CorL <- d2[splitIndex$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+valid.CorL <- d2[splitIndex$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorL$CorL, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorL), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorL <- train(CorL ~ ., 
+                  data = train.CorL, 
+                  method = "pls",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorL <- train(CorL ~ ., 
+                    data = train.CorL, 
+                    method = "rpart",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorL <- train(CorL ~ ., 
+                  data = train.CorL, 
+                  method = "gbm",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorL <- train(CorL ~ ., 
+                 data = train.CorL, 
+                 method = "ranger",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 tuneLength = 5,
+                 
+                 num.trees = 2000)
+
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorL <- train(CorL ~ ., 
+                       data = train.CorL, 
+                       method = "svmPoly",
+                       metric = "RMSE",
+                       trControl = fit_control,
+                       tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorL <- train(CorL ~ ., 
+                      data = train.CorL, 
+                      method = "svmRadial",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorL <- data.frame()
+
+
+res_CorL <- rbind(res_CorL, 
+                  ModelEvaluation(model = pls_CorL,
+                                  target.variable = "CorL",
+                                  train.data = train.CorL,
+                                  validation.data = valid.CorL,
+                                  model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorL,
+                        target.variable = "CorL",
+                        train.data = train.CorL,
+                        validation.data = valid.CorL,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorL,
+                        target.variable = "CorL",
+                        train.data = train.CorL,
+                        validation.data = valid.CorL,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorL,
+                        target.variable = "CorL",
+                        train.data = train.CorL,
+                        validation.data = valid.CorL,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorL,
+                        target.variable = "CorL",
+                        train.data = train.CorL,
+                        validation.data = valid.CorL,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorL,
+                        target.variable = "CorL",
+                        train.data = train.CorL,
+                        validation.data = valid.CorL,
+                        model.name = "svm.rad"))
+
+
+res_CorL %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+
+## Savitzky-Golay smoothed and differentiated ####
+
+set.seed(1810)
+splitIndex.smooth <- splitTools::partition(d2.smooth$CorL, 
+                                           p = c(train = 0.75, valid = 0.25))
+
+train.CorL.smooth <- d2.smooth[splitIndex.smooth$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+valid.CorL.smooth <- d2.smooth[splitIndex.smooth$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorL.smooth$CorL, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorL.smooth), by = 1)[-folds[[i]]]%>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorL.smooth <- train(CorL ~ ., 
+                         data = train.CorL.smooth, 
+                         method = "pls",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorL.smooth <- train(CorL ~ ., 
+                           data = train.CorL.smooth, 
+                           method = "rpart",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorL.smooth <- train(CorL ~ ., 
+                         data = train.CorL.smooth, 
+                         method = "gbm",
+                         metric = "RMSE",
+                         trControl = fit_control,
+                         tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorL.smooth <- train(CorL ~ ., 
+                        data = train.CorL.smooth, 
+                        method = "ranger",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5,
+                        
+                        num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorL.smooth <- train(CorL ~ ., 
+                              data = train.CorL.smooth, 
+                              method = "svmPoly",
+                              metric = "RMSE",
+                              trControl = fit_control,
+                              tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorL.smooth <- train(CorL ~ ., 
+                             data = train.CorL.smooth, 
+                             method = "svmRadial",
+                             metric = "RMSE",
+                             trControl = fit_control,
+                             tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+
+res_CorL.smooth <- data.frame()
+
+
+res_CorL.smooth <- rbind(res_CorL.smooth, 
+                         ModelEvaluation(model = pls_CorL.smooth,
+                                         target.variable = "CorL",
+                                         train.data = train.CorL.smooth,
+                                         validation.data = valid.CorL.smooth,
+                                         model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorL.smooth,
+                        target.variable = "CorL",
+                        train.data = train.CorL.smooth,
+                        validation.data = valid.CorL.smooth,
+                        model.name = "rpart")) %>%
+  
+  
+  rbind(ModelEvaluation(model = gbm_CorL.smooth,
+                        target.variable = "CorL",
+                        train.data = train.CorL.smooth,
+                        validation.data = valid.CorL.smooth,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorL.smooth,
+                        target.variable = "CorL",
+                        train.data = train.CorL.smooth,
+                        validation.data = valid.CorL.smooth,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorL.smooth,
+                        target.variable = "CorL",
+                        train.data = train.CorL.smooth,
+                        validation.data = valid.CorL.smooth,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorL.smooth,
+                        target.variable = "CorL",
+                        train.data = train.CorL.smooth,
+                        validation.data = valid.CorL.smooth,
+                        model.name = "svm.rad"))
+
+
+res_CorL.smooth %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+
+
+
+## Reduction of spectral range ####
+
+set.seed(1810)
+splitIndex.rsr <- splitTools::partition(d2.rsr$CorL, 
+                                        p = c(train = 0.75, valid = 0.25))
+
+train.CorL.rsr <- d2.rsr[splitIndex.rsr$train,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+valid.CorL.rsr <- d2.rsr[splitIndex.rsr$valid,] %>% 
+  select(-c("Amostra", "Temp", "Faz", "Maciez", "Marmoreio",
+            "CorA", "CorB"))
+
+
+
+# Creating folds for 10 fold cross-validation
+# I have to provide a list of rows to be used to train the model. By doing 10-fold
+# cross validation, the model will be trained on 9-parts of the data and evaluated
+# in the reaming 1-part. To specify that in the trainControl function, I can either
+# specify only the 9-folds indexes in the "index" argument OR I specify both 9-folds
+# and 1-fold in the "index" and "indexOut" arguments, respectevely. 
+# Using the first approach.
+
+set.seed(1801)
+folds <- createFolds(train.CorL.rsr$CorL, k = 10, list = TRUE)
+
+
+folds.in <- list()
+
+for(i in 1:length(folds)) {
+  
+  folds.in[[i]] <- seq(from = 1, to = nrow(train.CorL.rsr), by = 1)[-folds[[i]]] %>% 
+    as.integer()
+  
+  
+}
+
+names(folds.in) <- names(folds)
+
+
+
+set.seed(1801)
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "grid",
+                            index = folds.in,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", 
+                                            complete = TRUE),
+                            returnResamp = "all",
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(14)
+registerDoParallel(cl, cores = 14)
+
+getDoParWorkers()
+
+
+### Partial least square ####
+set.seed(1801)
+pls_CorL.rsr <- train(CorL ~ ., 
+                      data = train.CorL.rsr, 
+                      method = "pls",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 40)
+
+
+### RPART: Recursive partitioning tree ####
+set.seed(1801)
+rpart_CorL.rsr <- train(CorL ~ ., 
+                        data = train.CorL.rsr, 
+                        method = "rpart",
+                        metric = "RMSE",
+                        trControl = fit_control,
+                        tuneLength = 5)
+
+
+### Gradient boosting machine ####
+set.seed(1801)
+gbm_CorL.rsr <- train(CorL ~ ., 
+                      data = train.CorL.rsr, 
+                      method = "gbm",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      tuneLength = 5)
+
+
+### Random Forest ####
+set.seed(1801)
+rf_CorL.rsr <- train(CorL ~ ., 
+                     data = train.CorL.rsr, 
+                     method = "ranger",
+                     metric = "RMSE",
+                     trControl = fit_control,
+                     tuneLength = 5,
+                     
+                     num.trees = 2000)
+
+
+### Support vector machine with polynomial kernel ####
+set.seed(1801)
+svm_poly.CorL.rsr <- train(CorL ~ ., 
+                           data = train.CorL.rsr, 
+                           method = "svmPoly",
+                           metric = "RMSE",
+                           trControl = fit_control,
+                           tuneLength = 5)
+
+
+### Support vector machine with radial kernel ####
+set.seed(1801)
+svm_rad.CorL.rsr <- train(CorL ~ ., 
+                          data = train.CorL.rsr, 
+                          method = "svmRadial",
+                          metric = "RMSE",
+                          trControl = fit_control,
+                          tuneLength = 5)
+
+
+stopCluster(cl)
+
+
+###  Best model ####
+
+# Best model decided based on the lowest prediction error
+
+res_CorL.rsr <- data.frame()
+
+
+res_CorL.rsr <- rbind(res_CorL.rsr, 
+                      ModelEvaluation(model = pls_CorL.rsr,
+                                      target.variable = "CorL",
+                                      train.data = train.CorL.rsr,
+                                      validation.data = valid.CorL.rsr,
+                                      model.name = "pls")) %>%
+  
+  rbind(ModelEvaluation(model = rpart_CorL.rsr,
+                        target.variable = "CorL",
+                        train.data = train.CorL.rsr,
+                        validation.data = valid.CorL.rsr,
+                        model.name = "rpart")) %>%
+  
+  rbind(ModelEvaluation(model = gbm_CorL.rsr,
+                        target.variable = "CorL",
+                        train.data = train.CorL.rsr,
+                        validation.data = valid.CorL.rsr,
+                        model.name = "gbm")) %>%
+  
+  rbind(ModelEvaluation(model = rf_CorL.rsr,
+                        target.variable = "CorL",
+                        train.data = train.CorL.rsr,
+                        validation.data = valid.CorL.rsr,
+                        model.name = "rf")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_poly.CorL.rsr,
+                        target.variable = "CorL",
+                        train.data = train.CorL.rsr,
+                        validation.data = valid.CorL.rsr,
+                        model.name = "svm.poly")) %>% 
+  
+  rbind(ModelEvaluation(model = svm_rad.CorL.rsr,
+                        target.variable = "CorL",
+                        train.data = train.CorL.rsr,
+                        validation.data = valid.CorL.rsr,
+                        model.name = "svm.rad"))
+
+
+res_CorL.rsr %>% 
+  filter(data.set == "validation", metric == "RMSE") %>%
+  group_by(metric) %>% 
+  arrange(value, .by_group = TRUE)
+
+# Comb Res CorL ####
+
+comb_res_CorL <- res_CorL %>% 
+  mutate(trat = "raw") %>% 
+  rbind(res_CorL.rsr %>% 
+          mutate(trat = "rsr")) %>% 
+  rbind(res_CorL.smooth %>% 
+          mutate(trat = "sgsd")) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(model = factor(model, 
+                        levels = c("pls", "rpart", "gbm", "rf", "svm.poly",
+                                   "svm.rad")),
+         metric = factor(metric,
+                         levels = c("r2", "RMSE", "MAE", "MAAPE")),
+         
+         trat = factor(trat,
+                       levels = c("raw", "rsr", "sgsd")))
+
+
+comb_res_CorL %>% 
+  filter(data.set == "training", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>%
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
+
+
+
+comb_res_CorL %>% 
+  filter(data.set == "validation", metric == "MAAPE") %>% 
+  mutate_if(is.numeric, round, 2) %>% 
+  # rhandsontable::rhandsontable(useTypes = FALSE) %>%
+  arrange(value)
